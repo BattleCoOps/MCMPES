@@ -1,56 +1,262 @@
 import os
+import re
 import json
 import zipfile
 import shutil
+from dataclasses import dataclass, field
 
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, Button, DataTable, Log, Label
-from textual import on
 
 
-def get_mod_environment(jar_path: str) -> str:
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+CAT_CLIENT = "client"   # Client only
+CAT_SERVER = "server"   # Server only
+CAT_EITHER = "either"   # Client OR server (works on either, other side not required)
+CAT_BOTH = "both"       # Client AND server (required on both)
+
+CATEGORY_LABELS = {
+    CAT_CLIENT: "Client Only",
+    CAT_SERVER: "Server Only",
+    CAT_EITHER: "Client or Server",
+    CAT_BOTH: "Client AND Server",
+}
+
+# Which categories go into which pack
+CLIENT_PACK_CATS = {CAT_CLIENT, CAT_EITHER, CAT_BOTH}
+SERVER_PACK_CATS = {CAT_SERVER, CAT_EITHER, CAT_BOTH}
+
+# Entrypoint key names (Fabric / Quilt) grouped by side
+COMMON_EP_KEYS = {"main", "preLaunch", "init"}
+CLIENT_EP_KEYS = {"client", "client_init"}
+SERVER_EP_KEYS = {"server", "server_init"}
+
+# --- Bytecode signatures -----------------------------------------------------
+# Released Fabric jars are usually remapped to *intermediary* names
+# (net/minecraft/class_310 = MinecraftClient, class_3176 = DedicatedServer),
+# so "net/minecraft/client/" alone only matches Mojmap/Yarn/unobfuscated jars.
+# We check both naming schemes.
+CLIENT_RE = re.compile(
+    rb"net/minecraft/client/"
+    rb"|net/fabricmc/fabric/api/client/"
+    rb"|net/fabricmc/api/ClientModInitializer"
+    rb"|net/minecraft/class_310(?![0-9])"
+)
+SERVER_RE = re.compile(
+    rb"net/minecraft/server/dedicated/"
+    rb"|net/fabricmc/api/DedicatedServerModInitializer"
+    rb"|net/minecraft/class_3176(?![0-9])"
+)
+# Content registration: Registry.register (intermediary method_10230), Fabric
+# object builders / item groups, or Mojmap/Yarn Registry + "register".
+REGISTRY_RE = re.compile(
+    rb"method_10230(?![0-9])"
+    rb"|net/fabricmc/fabric/api/object/builder/v1/"
+    rb"|net/fabricmc/fabric/api/itemgroup/"
+)
+NAMED_REGISTRY_RE = re.compile(rb"net/minecraft/(?:core|registry)/Registry(?![A-Za-z0-9_])")
+# Custom networking protocol
+NETWORK_RE = re.compile(
+    rb"net/fabricmc/fabric/api/networking/v1/"
+    rb"(?:PayloadTypeRegistry|ServerPlayNetworking|ClientPlayNetworking)"
+)
+
+
+@dataclass
+class ModInfo:
+    category: str
+    declared: str = "-"
+    reasons: list = field(default_factory=list)
+
+    @property
+    def why(self) -> str:
+        return "; ".join(self.reasons)
+
+
+def _load_json(jar: zipfile.ZipFile, name: str) -> dict:
+    with jar.open(name) as f:
+        return json.loads(f.read().decode("utf-8-sig"))
+
+
+def _normalize_env(value) -> str:
+    value = str(value).lower() if value is not None else "*"
+    if value == "client":
+        return "client"
+    if value in ("server", "dedicated_server"):
+        return "server"
+    return "*"
+
+
+def _read_metadata(jar: zipfile.ZipFile, names: set):
     """
-    Inspects a .jar archive for Fabric or Quilt mod metadata.
-    Returns:
-        'client' - Client-side only
-        'server' - Server-side only
-        '*'      - Universal (Both client and server)
+    Returns (loader, declared_env, entrypoint_keys, mixin_configs) or None.
+    mixin_configs is a list of (config_filename, environment).
+    """
+    if "fabric.mod.json" in names:
+        data = _load_json(jar, "fabric.mod.json")
+        declared = _normalize_env(data.get("environment", "*"))
+        eps = {k for k, v in (data.get("entrypoints") or {}).items() if v}
+
+        mixins = []
+        for m in data.get("mixins") or []:
+            if isinstance(m, str):
+                mixins.append((m, "*"))
+            elif isinstance(m, dict) and "config" in m:
+                mixins.append((m["config"], _normalize_env(m.get("environment", "*"))))
+        return "fabric", declared, eps, mixins
+
+    if "quilt.mod.json" in names:
+        data = _load_json(jar, "quilt.mod.json")
+        loader = data.get("quilt_loader", {})
+        declared = _normalize_env(data.get("minecraft", {}).get("environment", "*"))
+        eps = {k for k, v in (loader.get("entrypoints") or {}).items() if v}
+
+        raw = data.get("mixin")
+        if isinstance(raw, str):
+            raw = [raw]
+        mixins = [(m, "*") for m in (raw or []) if isinstance(m, str)]
+        return "quilt", declared, eps, mixins
+
+    return None
+
+
+def _count_mixins(jar: zipfile.ZipFile, names: set, configs: list):
+    """Returns (common, client, server) mixin class counts."""
+    common = client = server = 0
+    for cfg, env in configs:
+        if cfg not in names:
+            continue
+        try:
+            data = _load_json(jar, cfg)
+        except Exception:
+            continue
+        c = len(data.get("mixins", []))
+        cl = len(data.get("client", []))
+        s = len(data.get("server", []))
+        if env == "client":
+            client += c + cl
+        elif env == "server":
+            server += c + s
+        else:
+            common += c
+            client += cl
+            server += s
+    return common, client, server
+
+
+def _scan_bytecode(jar: zipfile.ZipFile, names: set) -> dict:
+    """Scan class constant pools (plain byte search works for ASCII names)."""
+    result = {"client": 0, "server": 0, "registers": False, "network": False}
+    for name in names:
+        # skip non-classes, nested jars' contents, and multi-release copies
+        if not name.endswith(".class") or name.startswith("META-INF/"):
+            continue
+        data = jar.read(name)
+        if CLIENT_RE.search(data):
+            result["client"] += 1
+        if SERVER_RE.search(data):
+            result["server"] += 1
+        if not result["registers"]:
+            if REGISTRY_RE.search(data) or (
+                NAMED_REGISTRY_RE.search(data) and b"register" in data
+            ):
+                result["registers"] = True
+        if not result["network"] and NETWORK_RE.search(data):
+            result["network"] = True
+    return result
+
+
+def analyze_mod(jar_path: str) -> ModInfo:
+    """
+    Classifies a Fabric/Quilt mod jar into one of:
+        client  - client only
+        server  - server only
+        either  - works on client or server, other side not required
+        both    - must be installed on client AND server
+
+    1. fabric.mod.json / quilt.mod.json 'environment' (hard restriction)
+    2. Entrypoints + mixin configs (which side has real code)
+    3. Bytecode scan (client/server class refs, registry use, custom networking)
     """
     try:
-        with zipfile.ZipFile(jar_path, 'r') as jar:
-            if 'fabric.mod.json' in jar.namelist():
-                with jar.open('fabric.mod.json') as f:
-                    data = json.load(f)
-                    return data.get('environment', '*')
+        with zipfile.ZipFile(jar_path, "r") as jar:
+            names = set(jar.namelist())
+            meta = _read_metadata(jar, names)
 
-            if 'quilt.mod.json' in jar.namelist():
-                with jar.open('quilt.mod.json') as f:
-                    data = json.load(f)
-                    if 'quilt_loader' in data and 'environment' in data['quilt_loader']:
-                        return data['quilt_loader']['environment']
-                    return data.get('environment', '*')
+            if meta is None:
+                return ModInfo(
+                    CAT_EITHER, "-",
+                    ["No Fabric/Quilt metadata (Forge/NeoForge or library?) - assuming either"],
+                )
 
-            for file_info in jar.infolist():
-                if file_info.filename.endswith('.json') and '/' not in file_info.filename:
-                    try:
-                        with jar.open(file_info.filename) as f:
-                            data = json.load(f)
-                            if isinstance(data, dict) and 'environment' in data:
-                                return data['environment']
-                    except Exception:
-                        continue
+            loader, declared, eps, mixin_cfgs = meta
 
-    except (zipfile.BadZipFile, json.JSONDecodeError, KeyError):
-        pass
+            # --- Step 1: declared environment is authoritative -----------
+            if declared == "client":
+                return ModInfo(CAT_CLIENT, declared, [f"{loader}: environment=client"])
+            if declared == "server":
+                return ModInfo(CAT_SERVER, declared, [f"{loader}: environment=server"])
 
-    return '*'
+            # --- Step 2: entrypoints and mixins --------------------------
+            common_eps = eps & COMMON_EP_KEYS
+            client_eps = eps & CLIENT_EP_KEYS
+            server_eps = eps & SERVER_EP_KEYS
+            m_common, m_client, m_server = _count_mixins(jar, names, mixin_cfgs)
 
+            # --- Step 3: bytecode ----------------------------------------
+            scan = _scan_bytecode(jar, names)
+
+            has_common = bool(common_eps) or m_common > 0
+            has_client = bool(client_eps) or m_client > 0 or scan["client"] > 0
+            has_server = bool(server_eps) or m_server > 0 or scan["server"] > 0
+
+            reasons = ["environment=*"]
+            if eps:
+                reasons.append("entrypoints: " + ",".join(sorted(eps)))
+            if mixin_cfgs:
+                reasons.append(f"mixins c/cl/s: {m_common}/{m_client}/{m_server}")
+            if scan["client"]:
+                reasons.append(f"{scan['client']} class(es) use client code")
+            if scan["server"]:
+                reasons.append(f"{scan['server']} class(es) use dedicated-server code")
+
+            # Declared '*' but nothing runs on the common side -> really one-sided
+            if not has_common and has_client and not has_server:
+                reasons.append("no common code => client only")
+                return ModInfo(CAT_CLIENT, declared, reasons)
+            if not has_common and has_server and not has_client:
+                reasons.append("no common code => server only")
+                return ModInfo(CAT_SERVER, declared, reasons)
+
+            # Common code that changes shared state needs both sides
+            if scan["registers"]:
+                reasons.append("registers content")
+                return ModInfo(CAT_BOTH, declared, reasons)
+            if scan["network"]:
+                reasons.append("custom networking")
+                return ModInfo(CAT_BOTH, declared, reasons)
+
+            if not (has_common or has_client or has_server):
+                reasons.append("no code (library/data)")
+            return ModInfo(CAT_EITHER, declared, reasons)
+
+    except (zipfile.BadZipFile, OSError, KeyError, json.JSONDecodeError) as e:
+        return ModInfo(CAT_EITHER, "-", [f"Could not read jar ({type(e).__name__}) - assuming either"])
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 
 class ExportModal(ModalScreen[str]):
     """Modal dialog asking the user for an export target directory."""
-    
+
     CSS = """
     ExportModal {
         align: center middle;
@@ -166,7 +372,7 @@ class MCMPES(App):
 
     def __init__(self):
         super().__init__()
-        self.scanned_mods = []  # Tuples: (filename, env, full_path)
+        self.scanned_mods = []  # Tuples: (filename, ModInfo, full_path)
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="path_container"):
@@ -187,25 +393,39 @@ class MCMPES(App):
     def on_mount(self) -> None:
         table = self.query_one("#mod_table", DataTable)
         table.add_column("Filename", key="filename")
-        table.add_column("Environment", key="env")
+        table.add_column("Declared", key="declared")
+        table.add_column("Detected", key="detected")
         table.add_column("Destination Folder(s)", key="dest")
+        table.add_column("Why", key="why")
         table.cursor_type = "row"
-        
+
         log = self.query_one("#log_panel", Log)
         log.write_line("Application ready. Enter a directory path and click 'Scan Directory'.")
 
     def update_export_buttons(self) -> None:
         """Updates the export button labels with the number of files each will export."""
-        client_total = sum(1 for _, env, _ in self.scanned_mods if env in ("client", "*"))
-        server_total = sum(1 for _, env, _ in self.scanned_mods if env in ("server", "*"))
+        client_total = sum(1 for _, info, _ in self.scanned_mods if info.category in CLIENT_PACK_CATS)
+        server_total = sum(1 for _, info, _ in self.scanned_mods if info.category in SERVER_PACK_CATS)
         both_total = client_total + server_total
 
         self.query_one("#export_client_btn", Button).label = f"Export Client Pack ({client_total})"
         self.query_one("#export_server_btn", Button).label = f"Export Server Pack ({server_total})"
         self.query_one("#export_both_btn", Button).label = f"Export Both ({both_total})"
 
+    @staticmethod
+    def destination_for(category: str) -> str:
+        if category == CAT_CLIENT:
+            return "client_mods/"
+        if category == CAT_SERVER:
+            return "server_mods/"
+        return "client_mods/ & server_mods/"
+
     def scan_directory(self) -> None:
         log = self.query_one("#log_panel", Log)
+        scan_btn = self.query_one("#scan_btn", Button)
+        if scan_btn.disabled:
+            return  # a scan is already running
+
         dir_input = self.query_one("#dir_input", Input).value.strip('"\' ')
         table = self.query_one("#mod_table", DataTable)
         stats_label = self.query_one("#stats_label", Label)
@@ -220,10 +440,10 @@ class MCMPES(App):
             return
 
         target_dir = os.path.abspath(dir_input)
-        jar_files = [
+        jar_files = sorted(
             f for f in os.listdir(target_dir)
             if f.endswith('.jar') and os.path.isfile(os.path.join(target_dir, f))
-        ]
+        )
 
         if not jar_files:
             log.write_line(f"[INFO] No .jar files found in '{target_dir}'.")
@@ -231,36 +451,51 @@ class MCMPES(App):
             return
 
         log.write_line(f"[INFO] Scanning {len(jar_files)} .jar file(s) in '{target_dir}'...")
+        stats_label.update("Scanning...")
+        scan_btn.disabled = True
+        self.run_scan(target_dir, jar_files)
 
-        client_count = 0
-        server_count = 0
-        universal_count = 0
-
+    @work(thread=True)
+    def run_scan(self, target_dir: str, jar_files: list) -> None:
+        """Runs in a worker thread so bytecode scanning doesn't freeze the UI."""
+        results = []
         for filename in jar_files:
             full_path = os.path.join(target_dir, filename)
-            env = get_mod_environment(full_path)
-            self.scanned_mods.append((filename, env, full_path))
+            info = analyze_mod(full_path)
+            results.append((filename, info, full_path))
+            self.call_from_thread(self.add_mod_row, filename, info)
+        self.call_from_thread(self.finish_scan, results)
 
-            if env == 'client':
-                env_display = "Client Only"
-                dest_display = "client_mods/"
-                client_count += 1
-            elif env == 'server':
-                env_display = "Server Only"
-                dest_display = "server_mods/"
-                server_count += 1
-            else:
-                env_display = "Universal (*)"
-                dest_display = "client_mods/ & server_mods/"
-                universal_count += 1
+    def add_mod_row(self, filename: str, info: ModInfo) -> None:
+        table = self.query_one("#mod_table", DataTable)
+        table.add_row(
+            filename,
+            info.declared,
+            CATEGORY_LABELS[info.category],
+            self.destination_for(info.category),
+            info.why,
+        )
 
-            table.add_row(filename, env_display, dest_display)
-
+    def finish_scan(self, results: list) -> None:
+        log = self.query_one("#log_panel", Log)
+        stats_label = self.query_one("#stats_label", Label)
+        self.scanned_mods = results
         self.update_export_buttons()
 
-        summary = f"Found {len(jar_files)} mods -> Client-Only: {client_count} | Server-Only: {server_count} | Universal: {universal_count}"
+        counts = {cat: 0 for cat in CATEGORY_LABELS}
+        for _, info, _ in results:
+            counts[info.category] += 1
+
+        summary = (
+            f"Found {len(results)} mods -> "
+            f"Client-Only: {counts[CAT_CLIENT]} | "
+            f"Server-Only: {counts[CAT_SERVER]} | "
+            f"Client-or-Server: {counts[CAT_EITHER]} | "
+            f"Client-AND-Server: {counts[CAT_BOTH]}"
+        )
         stats_label.update(summary)
         log.write_line(f"[SUCCESS] Scan complete. {summary}")
+        self.query_one("#scan_btn", Button).disabled = False
 
     def prompt_export(self, export_target: str) -> None:
         log = self.query_one("#log_panel", Log)
@@ -292,20 +527,16 @@ class MCMPES(App):
 
         log.write_line(f"[ACTION] Starting export (Target: {export_target.upper()}) to '{base_dir}'...")
 
-        for filename, env, full_path in self.scanned_mods:
-            if export_target in ("client", "both"):
-                if env in ("client", "*"):
-                    dest = os.path.join(client_dir, filename)
-                    shutil.copy2(full_path, dest)
-                    copied_count += 1
-                    log.write_line(f" -> Copied {filename} to client_mods/")
+        for filename, info, full_path in self.scanned_mods:
+            if export_target in ("client", "both") and info.category in CLIENT_PACK_CATS:
+                shutil.copy2(full_path, os.path.join(client_dir, filename))
+                copied_count += 1
+                log.write_line(f" -> Copied {filename} to client_mods/")
 
-            if export_target in ("server", "both"):
-                if env in ("server", "*"):
-                    dest = os.path.join(server_dir, filename)
-                    shutil.copy2(full_path, dest)
-                    copied_count += 1
-                    log.write_line(f" -> Copied {filename} to server_mods/")
+            if export_target in ("server", "both") and info.category in SERVER_PACK_CATS:
+                shutil.copy2(full_path, os.path.join(server_dir, filename))
+                copied_count += 1
+                log.write_line(f" -> Copied {filename} to server_mods/")
 
         log.write_line(f"[SUCCESS] Export complete! Executed {copied_count} file copy operation(s) into '{base_dir}'.")
 
