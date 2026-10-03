@@ -18,4 +18,4 @@
 **! [PyInstaller](https://pypi.org/project/pyinstaller/) and [Textual](https://pypi.org/project/textual/) are required for any of these methods !**
   
 
-![Photo of the tool.](https://github.com/BattleCoOps/MCMPES/blob/a2f8868ea4081eb408a81ced3269f1ae62a33fd5/photos/photo%20v.1.0.0.svg)
+![Photo of the tool.](https://github.com/BattleCoOps/MCMPES/blob/e71b02cc6a26bf0747bcaa7805b72dbb02fbae9e/photos/photo%20v1.1.0.svg)
