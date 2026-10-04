@@ -79,9 +79,47 @@ class ModInfo:
         return "; ".join(self.reasons)
 
 
+def _strip_json_extras(text: str) -> str:
+    """Remove // and /* */ comments (outside strings) and trailing commas."""
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
 def _load_json(jar: zipfile.ZipFile, name: str) -> dict:
-    with jar.open(name) as f:
-        return json.loads(f.read().decode("utf-8-sig"))
+    """Lenient JSON loader, mirroring how Fabric Loader tolerates sloppy metadata."""
+    text = jar.read(name).decode("utf-8-sig")
+    try:
+        # strict=False allows raw control characters (newlines/tabs) in strings
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        return json.loads(_strip_json_extras(text), strict=False)
 
 
 def _normalize_env(value) -> str:
@@ -187,7 +225,21 @@ def analyze_mod(jar_path: str) -> ModInfo:
     try:
         with zipfile.ZipFile(jar_path, "r") as jar:
             names = set(jar.namelist())
-            meta = _read_metadata(jar, names)
+            try:
+                meta = _read_metadata(jar, names)
+            except json.JSONDecodeError:
+                # Last resort: pull "environment" straight out of the raw text
+                meta_name = "fabric.mod.json" if "fabric.mod.json" in names else "quilt.mod.json"
+                raw = jar.read(meta_name).decode("utf-8-sig", errors="replace")
+                m = re.search(r'"environment"\s*:\s*"([^"]*)"', raw)
+                env = _normalize_env(m.group(1)) if m else "*"
+                if env in ("client", "server"):
+                    cat = CAT_CLIENT if env == "client" else CAT_SERVER
+                    return ModInfo(cat, env, [f"{meta_name} unparseable; environment found via regex"])
+                return ModInfo(
+                    CAT_EITHER, "?",
+                    [f"{meta_name} unparseable and no environment found - REVIEW MANUALLY"],
+                )
 
             if meta is None:
                 return ModInfo(
