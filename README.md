@@ -1,5 +1,5 @@
 
-# What is MPE?
+# What is MCMPES?
 
 **MCMPES** (Minecraft Modpack Environment Sorter) is a utility that takes a folder of mods and generates a **Server Pack** to be easily used on servers. It does this by reading the .jar files and sorting them based on the environment provided. It also generates a **Client Pack** as well.
 
@@ -18,4 +18,4 @@
 **! [PyInstaller](https://pypi.org/project/pyinstaller/) and [Textual](https://pypi.org/project/textual/) are required for any of these methods !**
   
 
-![Photo of the tool.](https://github.com/BattleCoOps/MCMPES/blob/e71b02cc6a26bf0747bcaa7805b72dbb02fbae9e/photos/photo%20v1.1.0.svg)
+![Photo of the tool.](https://github.com/BattleCoOps/MCMPES/blob/f1921bd688eb264eb8741f70f3ad1530d8eade60/photos/photo%20v1.2.0.svg)
